@@ -7,6 +7,7 @@
 #include <soc.h>
 #include <stddef.h>
 #include <string.h>
+#include <assert.h>
 #include <zephyr/types.h>
 
 #include <stdio.h>
@@ -14,9 +15,9 @@
 #include <zephyr/kernel.h>
 #include <zephyr/usb/usb_device.h>
 
-#include <neuton/neuton.h>
-#include <neuton/neuton_version.h>
-#include <neuton_generated/neuton_user_model.h>
+#include <nrf_edgeai/nrf_edgeai.h>
+#include <nrf_edgeai_generated/nrf_edgeai_user_model.h>
+
 #include <button/bsp_button.h>
 #include <led/bsp_led.h>
 #include <sensor/imu/bsp_imu.h>
@@ -29,7 +30,7 @@
 
 #define ACCEL_AXIS_NUM (3U)
 #define GYRO_AXIS_NUM (3U)
-#define NEUTON_INPUT_DATA_LEN (ACCEL_AXIS_NUM + GYRO_AXIS_NUM)
+#define NRF_EDGEAI_INPUT_DATA_LEN (ACCEL_AXIS_NUM + GYRO_AXIS_NUM)
 
 #define BLINK_LED_TIMER_PERIOD_MS (30)
 #define LED_MAX_BRIGHTNESS (0.2f)
@@ -80,7 +81,7 @@ static void ble_connection_cb_(bool connected);
 static void button_click_handler_(bool pressed);
 #ifndef CONFIG_DATA_COLLECTION_MODE
 static void send_bt_keyboard_key_(const class_label_t class_label);
-static void neuton_prediction_handler_(const class_label_t class_label, 
+static void model_prediction_handler_(const class_label_t class_label, 
                                         const float probability,
                                         const char* class_name,
                                         const bool is_raw);
@@ -98,7 +99,7 @@ static struct k_sem imu_data_ready_sem_;
 // Work queue items for deferring interrupt context LED operations to thread context
 static struct k_work led_update_work;
 static struct k_work button_work;
-static neuton_nn_t* p_nn_ = NULL;
+static nrf_edgeai_t* p_model_ = NULL;
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -111,17 +112,24 @@ int main(void)
     /** Initialize Board Support Package */
     board_support_init_();
 
-    /** Initialize Neuton.AI library */
-    p_nn_ = neuton_nn_user_model();
-    neuton_nn_setup(p_nn_);
+    /** Get generated user model runtime context */
+    p_model_ = nrf_edgeai_user_model();
+    assert(p_model_ != NULL);
+    assert(nrf_edgeai_is_runtime_compatible(p_model_));
 
-    printk("Neuton.AI Nordic Thingy 53 Gestures Recognition Demo: \r\n");
+    /** Initialize nRF Edge AI library */
+    nrf_edgeai_err_t res = nrf_edgeai_init(p_model_);
+    assert(res == NRF_EDGEAI_ERR_SUCCESS);
+    
+    nrf_edgeai_rt_version_t version = nrf_edgeai_runtime_version();
+
+    printk("nRF Edge AI Gestures Recognition Demo: \r\n");
     printk("\t Application version: %d.%d.%d\r\n", APP_VERSION_MAJOR, APP_VERSION_MINOR, APP_VERSION_PATCH);
-    printk("\t Neuton Version: %d.%d.%d\r\n", NEUTON_MAJOR_VERSION, NEUTON_MINOR_VERSION, NEUTON_PATCH_VERSION);
-    printk("\t Neuton Solution id: %s\r\n", neuton_nn_solution_id_str(p_nn_));
+    printk("\t nRF Edge AI Runtime Version: %d.%d.%d\r\n", version.field.major, version.field.minor, version.field.patch);
+    printk("\t nRF Edge AI Lab Solution id: %s\r\n", nrf_edgeai_solution_id_str(p_model_));
 
     bsp_imu_data_t imu_data = {0};
-    neuton_i16_t input_data[NEUTON_INPUT_DATA_LEN];
+    int16_t input_data[NRF_EDGEAI_INPUT_DATA_LEN];
 
     for (;;)
     {
@@ -142,28 +150,28 @@ int main(void)
 #if CONFIG_DATA_COLLECTION_MODE
         printk("%d,%d,%d,%d,%d,%d\r\n",  input_data[0], input_data[1], input_data[2], input_data[3], input_data[4], input_data[5]);
 #else        
-        neuton_status_t res = neuton_nn_feed_inputs(p_nn_, input_data, NEUTON_INPUT_DATA_LEN);
+        res = nrf_edgeai_feed_inputs(p_model_, input_data, NRF_EDGEAI_INPUT_DATA_LEN);
 
         /** Check if input data window is ready for inference */
-        if (res == NEUTON_STATUS_SUCCESS)
+        if (res == NRF_EDGEAI_ERR_SUCCESS)
         {
             /** Run Neuton model inference */
-            res = neuton_nn_run_inference(p_nn_);
+            res = nrf_edgeai_run_inference(p_model_);
 
             /** Handle Neuton inference results if the prediction was
              * successful */
-            if (res == NEUTON_STATUS_SUCCESS)
+            if (res == NRF_EDGEAI_ERR_SUCCESS)
             {
                 /** Predicted class */
-                neuton_u16_t predicted_target = p_nn_->decoded_output.classif.predicted_class;
+                uint16_t predicted_target = p_model_->decoded_output.classif.predicted_class;
                 /** Probabilities pointer depend on model output quantization setting */
-                const neuton_f32_t* p_probabilities = p_nn_->decoded_output.classif.probabilities.p_f32;
+                const flt32_t* p_probabilities = p_model_->decoded_output.classif.probabilities.p_f32;
 
                 bool do_postprocessing = true;
                 inference_postprocess(predicted_target,
                                       p_probabilities[predicted_target],
                                       do_postprocessing,
-                                      neuton_prediction_handler_);
+                                      model_prediction_handler_);
             }
         }
 #endif // CONFIG_DATA_COLLECTION_MODE
@@ -305,7 +313,7 @@ static void imu_data_ready_cb_(void)
 
 //////////////////////////////////////////////////////////////////////////////
 #ifndef CONFIG_DATA_COLLECTION_MODE
-static void neuton_prediction_handler_(const class_label_t class_label, 
+static void model_prediction_handler_(const class_label_t class_label, 
                                         const float probability,
                                         const char* class_name,
                                         const bool is_raw)
